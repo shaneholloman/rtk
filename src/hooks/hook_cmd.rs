@@ -31,8 +31,10 @@ fn read_stdin_limited() -> Result<String> {
 enum HookFormat {
     /// VS Code Copilot Chat / Claude Code: `tool_name` + `tool_input.command`, supports `updatedInput`.
     VsCode { command: String },
-    /// GitHub Copilot CLI: camelCase `toolName` + `toolArgs` (JSON string), deny-with-suggestion only.
-    CopilotCli { command: String },
+    /// GitHub Copilot CLI: camelCase `toolName` + `toolArgs` (JSON string), supports `modifiedArgs` for transparent rewrite.
+    /// Carries the full parsed `toolArgs` object so we can rewrite `command` while preserving
+    /// host-supplied metadata (description, initial_wait, mode, …) the tool requires.
+    CopilotCli { command: String, args: Value },
     /// Non-bash tool, already uses rtk, or unknown format — pass through silently.
     PassThrough,
 }
@@ -42,7 +44,9 @@ enum HookFormat {
 pub fn run_copilot() -> Result<()> {
     let input = read_stdin_limited()?;
 
-    let input = input.trim();
+    // Strip leading BOM(s) before trimming: some Windows hosts prepend UTF-8
+    // BOMs to hook stdin (confirmed for Cursor), which serde_json rejects.
+    let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
         return Ok(());
     }
@@ -57,7 +61,7 @@ pub fn run_copilot() -> Result<()> {
 
     match detect_format(&v) {
         HookFormat::VsCode { command } => handle_vscode(&command),
-        HookFormat::CopilotCli { command } => handle_copilot_cli(&command),
+        HookFormat::CopilotCli { command, args } => handle_copilot_cli(&command, &args),
         HookFormat::PassThrough => Ok(()),
     }
 }
@@ -91,6 +95,7 @@ fn detect_format(v: &Value) -> HookFormat {
                     {
                         return HookFormat::CopilotCli {
                             command: cmd.to_string(),
+                            args: tool_args,
                         };
                     }
                 }
@@ -170,32 +175,51 @@ fn handle_vscode(cmd: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_copilot_cli(cmd: &str) -> Result<()> {
-    if permissions::check_command(cmd) == PermissionVerdict::Deny {
-        audit_log("deny", cmd, "");
-        return Ok(());
+fn handle_copilot_cli(cmd: &str, args: &Value) -> Result<()> {
+    if let Some(response) = copilot_cli_response(cmd, args) {
+        let _ = writeln!(io::stdout(), "{response}");
     }
+    Ok(())
+}
 
-    if crate::discover::lexer::contains_unattestable_construct(cmd) {
-        return Ok(());
-    }
+fn copilot_cli_response(cmd: &str, args: &Value) -> Option<Value> {
+    copilot_cli_response_from_decision(
+        args,
+        decide_hook_action(cmd, permissions::Host::Claude),
+        cmd,
+    )
+}
 
-    let rewritten = match get_rewritten(cmd) {
-        Some(r) => r,
-        None => return Ok(()),
+fn copilot_cli_response_from_decision(
+    args: &Value,
+    decision: HookDecision,
+    cmd: &str,
+) -> Option<Value> {
+    let (rewritten, allow) = match decision {
+        HookDecision::Deny => {
+            audit_log("deny", cmd, "");
+            return None;
+        }
+        HookDecision::Defer => return None,
+        HookDecision::AllowRewrite(r) => (r, true),
+        HookDecision::AskRewrite(r) => (r, false),
     };
 
     audit_log("rewrite", cmd, &rewritten);
 
-    let output = json!({
-        "permissionDecision": "deny",
-        "permissionDecisionReason": format!(
-            "Token savings: use `{}` instead (rtk saves 60-90% tokens)",
-            rewritten
-        )
+    let mut modified = args.clone();
+    if let Some(obj) = modified.as_object_mut() {
+        obj.insert("command".into(), Value::String(rewritten));
+    }
+
+    let mut response = json!({
+        "permissionDecisionReason": "RTK auto-rewrite",
+        "modifiedArgs": modified,
     });
-    let _ = writeln!(io::stdout(), "{output}");
-    Ok(())
+    if allow {
+        response["permissionDecision"] = json!("allow");
+    }
+    Some(response)
 }
 
 // ── Gemini hook ───────────────────────────────────────────────
@@ -570,6 +594,25 @@ mod tests {
     }
 
     #[test]
+    fn test_copilot_bom_prefixed_payload_is_recognized() {
+        // Windows hosts may prepend one or two UTF-8 BOMs to hook stdin
+        // (confirmed for Cursor). run_copilot strips them before parsing;
+        // verify both Copilot formats still parse after the same handling.
+        for raw in [
+            format!("\u{feff}{}", copilot_cli_input("git status")),
+            format!("\u{feff}\u{feff}{}", copilot_cli_input("git status")),
+        ] {
+            let cleaned = strip_leading_bom(&raw).trim();
+            let v: Value = serde_json::from_str(cleaned).expect("BOM-stripped JSON must parse");
+            assert!(matches!(detect_format(&v), HookFormat::CopilotCli { .. }));
+        }
+
+        let raw = format!("\u{feff}{}", vscode_input("Bash", "git status"));
+        let v: Value = serde_json::from_str(strip_leading_bom(&raw).trim()).unwrap();
+        assert!(matches!(detect_format(&v), HookFormat::VsCode { .. }));
+    }
+
+    #[test]
     fn test_detect_unknown_is_passthrough() {
         assert!(matches!(detect_format(&json!({})), HookFormat::PassThrough));
     }
@@ -592,6 +635,187 @@ mod tests {
     #[test]
     fn test_get_rewritten_heredoc() {
         assert!(get_rewritten("cat <<'EOF'\nhello\nEOF").is_none());
+    }
+
+    // --- Copilot CLI handler: transparent rewrite via modifiedArgs ---
+
+    fn cli_args(cmd: &str) -> Value {
+        json!({ "command": cmd })
+    }
+
+    #[test]
+    fn test_copilot_cli_ask_rewrite_omits_permission_decision() {
+        let r = copilot_cli_response_from_decision(
+            &cli_args("cargo test"),
+            HookDecision::AskRewrite("rtk cargo test".into()),
+            "cargo test",
+        )
+        .unwrap();
+        assert!(
+            r.get("permissionDecision").is_none(),
+            "AskRewrite must NOT set permissionDecision — Copilot then runs its normal prompt flow on the rewritten command"
+        );
+        assert_eq!(r["modifiedArgs"]["command"], "rtk cargo test");
+    }
+
+    #[test]
+    fn test_copilot_cli_allow_rewrite_returns_allow() {
+        let r = copilot_cli_response_from_decision(
+            &cli_args("cargo test"),
+            HookDecision::AllowRewrite("rtk cargo test".into()),
+            "cargo test",
+        )
+        .unwrap();
+        assert_eq!(r["permissionDecision"], "allow");
+        assert_eq!(r["modifiedArgs"]["command"], "rtk cargo test");
+    }
+
+    #[test]
+    fn test_copilot_cli_deny_returns_none() {
+        assert!(copilot_cli_response_from_decision(
+            &cli_args("cargo test"),
+            HookDecision::Deny,
+            "cargo test",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_copilot_cli_defer_returns_none() {
+        // Defer covers both "no rewrite available" and the unattestable-construct gate.
+        // The hook must emit NO modifiedArgs for CVE bypass forms — no laundering.
+        assert!(copilot_cli_response_from_decision(
+            &cli_args("git status & rm -rf /tmp/x"),
+            HookDecision::Defer,
+            "git status & rm -rf /tmp/x",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_copilot_cli_passthrough_unsupported() {
+        assert!(copilot_cli_response("htop", &cli_args("htop")).is_none());
+    }
+
+    #[test]
+    fn test_copilot_cli_passthrough_already_rtk() {
+        assert!(copilot_cli_response("rtk cargo test", &cli_args("rtk cargo test")).is_none());
+    }
+
+    #[test]
+    fn test_copilot_cli_passthrough_heredoc() {
+        let cmd = "cat <<EOF\nhi\nEOF";
+        assert!(copilot_cli_response(cmd, &cli_args(cmd)).is_none());
+    }
+
+    #[test]
+    fn test_copilot_cli_preserves_env_prefix() {
+        let r = copilot_cli_response(
+            "RUST_LOG=debug cargo test",
+            &cli_args("RUST_LOG=debug cargo test"),
+        )
+        .unwrap();
+        assert_eq!(
+            r["modifiedArgs"]["command"],
+            "RUST_LOG=debug rtk cargo test"
+        );
+    }
+
+    #[test]
+    fn test_copilot_cli_preserves_extra_args_fields() {
+        let args = json!({
+            "command": "cargo install ripgrep",
+            "description": "install ripgrep",
+            "initial_wait": 30,
+            "mode": "sync"
+        });
+        let r = copilot_cli_response_from_decision(
+            &args,
+            HookDecision::AskRewrite("rtk cargo install ripgrep".into()),
+            "cargo install ripgrep",
+        )
+        .unwrap();
+        let modified = &r["modifiedArgs"];
+        assert_eq!(modified["command"], "rtk cargo install ripgrep");
+        assert_eq!(modified["description"], "install ripgrep");
+        assert_eq!(modified["initial_wait"], 30);
+        assert_eq!(modified["mode"], "sync");
+    }
+
+    fn end_to_end(cmd: &str) -> Option<Value> {
+        let verdict = crate::hooks::permissions::check_command_with_rules(
+            cmd,
+            &[],
+            &[],
+            &["Bash(git:*)".to_string()],
+        );
+        copilot_cli_response_from_decision(&cli_args(cmd), decide_from_verdict(cmd, verdict), cmd)
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_safe_forms_still_rewrite() {
+        for cmd in ["git status", "git status 2>&1"] {
+            let r = end_to_end(cmd).unwrap_or_else(|| panic!("expected rewrite for {cmd:?}"));
+            assert_eq!(
+                r["modifiedArgs"]["command"].as_str().unwrap(),
+                format!("rtk {cmd}"),
+                "safe form {cmd:?} must rewrite",
+            );
+        }
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_newline_bypass_never_auto_allows() {
+        let r = end_to_end("git status\nrm -rf /tmp/x");
+        if let Some(resp) = r {
+            assert!(
+                resp.get("permissionDecision").is_none(),
+                "newline-hidden command must not produce permissionDecision: \"allow\""
+            );
+        }
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_background_bypass_never_auto_allows() {
+        let r = end_to_end("git status & rm -rf /tmp/x");
+        if let Some(resp) = r {
+            assert!(
+                resp.get("permissionDecision").is_none(),
+                "background-& hidden command must not produce permissionDecision: \"allow\""
+            );
+        }
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_command_substitution_returns_none() {
+        assert!(
+            end_to_end("git log --pretty=$(rm -rf /tmp/x)").is_none(),
+            "$( ) command substitution must not produce modifiedArgs"
+        );
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_backtick_substitution_returns_none() {
+        assert!(
+            end_to_end("git log --pretty=`rm -rf /tmp/x`").is_none(),
+            "backtick substitution must not produce modifiedArgs"
+        );
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_file_redirect_amp_returns_none() {
+        assert!(
+            end_to_end("git status >& /tmp/evil").is_none(),
+            ">&file redirect must not produce modifiedArgs"
+        );
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_file_redirect_returns_none() {
+        assert!(
+            end_to_end("git status > /tmp/evil").is_none(),
+            ">file redirect must not produce modifiedArgs"
+        );
     }
 
     // --- Gemini format ---

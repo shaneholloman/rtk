@@ -1188,8 +1188,10 @@ mod tests {
     #[test]
     fn test_unattestable_file_redirects() {
         assert!(contains_unattestable_construct("git log > /tmp/x"));
+        // nosemgrep: sensitive-path-reference -- test fixture
         assert!(contains_unattestable_construct("echo evil >> ~/.bashrc"));
         assert!(contains_unattestable_construct("cmd &> /tmp/x"));
+        // nosemgrep: sensitive-path-reference -- test fixture
         assert!(contains_unattestable_construct("cat < /etc/passwd"));
         assert!(contains_unattestable_construct("cat << EOF"));
     }
@@ -1198,6 +1200,7 @@ mod tests {
     fn test_unattestable_ampersand_file_redirect() {
         // `>&word` (word not a number) == `>word 2>&1` — a file write.
         assert!(contains_unattestable_construct("git status >& /tmp/evil"));
+        // nosemgrep: sensitive-path-reference -- test fixture
         assert!(contains_unattestable_construct("cat x >&~/.bashrc"));
         assert!(contains_unattestable_construct("echo hi 2>& /tmp/evil"));
     }

@@ -893,6 +893,7 @@ mod tests {
     fn test_file_redirect_never_auto_allowed() {
         let allow = vec!["git *".to_string()];
         assert_eq!(
+            // nosemgrep: sensitive-path-reference -- test fixture
             check_command_with_rules("git log > ~/.bashrc", &[], &[], &allow),
             PermissionVerdict::Ask
         );
